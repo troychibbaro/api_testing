@@ -1,21 +1,20 @@
-from fastapi import FastAPI, BackgroundTasks
-import pandas as pd
 import datetime
 from fastapi import FastAPI, Request
 from deta import Deta
 from typing import Union
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from flask import Flask, request, jsonify
+from flask import jsonify
+from pydantic import BaseModel
+from datetime import datetime
 
 app = FastAPI()
 deta = Deta()
 db = deta.Base("geodata_db")
+message_db = deta.Base("message_db")
+
 
 #app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 templates = Jinja2Templates(directory="templates")
-
 
 
 @app.get("/")
@@ -23,56 +22,68 @@ async def root(request: Request):
     return templates.TemplateResponse("splash/login.html", {"request": request})
 
 
-@app.get("/hello/{name}")
-async def say_hello(name: str):
-    return {"message": f"Hello {name}"}
+"""
+Geolocation Data
+"""
+
+class GeoDict(BaseModel):
+    device: str
+    lat: float
+    long: float
+    task: str
+    uid: str
 
 
-def handle_visit(visitor):
-    df = pd.read_csv("data/login_history/visits.csv")
-    df.loc[len(df.index)] = (visitor, datetime.datetime.today())
-    df.to_csv("data/login_history/visits.csv", index=False)
+@app.get("/geo/{device}-logs")
+async def device_logs(device: str, latest: Union[bool, None] = None):
+    logs = db.fetch({"device": device})
+    if latest and logs.items:
+        return db.fetch(logs.last).items
+    return logs.items if logs.items else jsonify({"Error": "Entry not found"}, 404)
 
 
-@app.get("/log-visit/{visitor}")
-async def log_visit(visitor: str, tasks: BackgroundTasks):
-    tasks.add_task(handle_visit, visitor)
-    return {'message': 'your visit has been logged'}
+@app.get("/geo/{device}-logs/siri/")
+async def device_logs_siri(device: str):
+    logs = db.fetch({"device": device})
+    if logs.items:
+        i = len(logs.items) - 1
+        latest = logs.items[i]
+        lat = latest['lat']
+        long = latest['long']
+        task = latest['task']
+        return {"task": task, "long": long, "lat": lat}
 
 
-@app.get("/get-visit-data")
-async def get_visit_data():
-    return pd.read_csv("data/login_history/visits.csv").to_json()
+@app.post("/geo/report-geo/")
+async def report_geographic_data(data: GeoDict):
+    conv = data.dict()
+    db.put(conv, key=str(datetime.today()))
+    return conv
 
 
-@app.get("/report-geo/{userId}/{lat}/{long}/{device}/{task}")
-async def report_geographic_data(userId: str, lat: str, long: str, device: str, task: str):
-    db.put({"userId": userId, "lat": lat, "long": long, "device": device, "task": task})
-    return {"message": "geo data logged"}
+"""Messages"""
 
 
-@app.get("/report-geo/{userId}/{lat}/{long}/{device}/{task}/{expires}/{exp_time}")
-async def report_geographic_data(userId: str, lat: str, long: str, device: str, task: str, expires: Union[bool, None] = None, exp_time: Union[int, None] = None):
-    db.put({"userId": userId, "lat": lat, "long": long, "device": device, "task": task}, expire_in=exp_time)
-    return {"message": f"geo data logged and will expire in {exp_time/60:.2f} minutes"}
+class Message(BaseModel):
+    sender: str
+    recipient: str
+    message: str
+    expires_min: int
 
 
-@app.get("/geo/watch-logs")
-async def watch_logs():
-    logs = db.fetch({"device": "Watch"})
-    return logs if logs else jsonify({"Error": "Not found"}, 404)
+@app.post("/mes/issue-message")
+async def issue_message(mes: Message):
+    exp = mes.expires_min
+    d = mes.dict()
+    d.pop('expires_min')
+    message_db.put(d, key=str(datetime.today()), expire_in=exp*60)
+    return {"Message": "Your message has been sent"}
 
 
-@app.get("/dbtest")
-async def db_test():
-    db.put({"key": "userId", "lat": "lat", "long": "long", "device": "device"})
-    return {"message": "Successfully inserted to DB"}
-
-@app.get("/login")
-async def login(username: str, password: str, request: Request):
-    df = pd.read_csv("data/credentials/users.csv", index_col="uname")
-    print(df)
-    if username in df.index:
-        if df.loc[username]['pword'] == password:
-            return RedirectResponse(f"/log-visit/{username}")
-    return templates.TemplateResponse("login-process/login-denied.html", {"request": request})
+@app.get("/mes/get-last-message-{uid}")
+async def get_last_message(uid: str):
+    logs = message_db.fetch({"recipient": uid})
+    if logs.items:
+        i = len(logs.items) - 1
+        latest = logs.items[i]
+        return latest
